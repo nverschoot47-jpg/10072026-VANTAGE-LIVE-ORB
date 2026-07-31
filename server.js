@@ -88,6 +88,15 @@ async function handleOrder(o) {
 
   const { total, n } = await db.openRiskPct();
   const { pct: riskPct, bron: riskBron } = resolveRiskPct(o.risk_pct);
+
+  // insertSignal schreef o.risk_pct weg — de waarde UIT DE PAYLOAD. Zodra
+  // RISK_PCT_OVERRIDE gezet is, is dat niet het risico dat we werkelijk nemen.
+  // openRiskPct() telt die kolom op, dus zonder deze regel meet de rem iets
+  // anders dan er op tafel ligt: bij override 3% en payload 0.25% telt de rem
+  // 0.25 per positie en laat hij er 29 toe — samen bijna 60% van de rekening.
+  // De originele payloadwaarde blijft bewaard in signals.raw.
+  await db.pool.query('UPDATE signals SET risk_pct=$2 WHERE id=$1', [sig.id, riskPct]);
+
   if (n >= MAX_OPEN) {
     const r = `MAX_OPEN_POSITIONS bereikt (${n}/${MAX_OPEN})`;
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'rejected', r]);
