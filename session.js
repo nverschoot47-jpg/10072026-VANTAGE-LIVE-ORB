@@ -9,8 +9,16 @@
 export const FIRM             = process.env.FIRM || 'fundednext';
 export const TRADING_ENABLED  = (process.env.TRADING_ENABLED ?? 'true') === 'true';
 export const ENFORCE_EXPIRY   = (process.env.ENFORCE_EXPIRY ?? 'false') === 'true';
-export const MAX_OPEN         = parseInt(process.env.MAX_OPEN_POSITIONS  || '40', 10);
-export const MAX_RISK_TOTAL   = parseFloat(process.env.MAX_RISK_PCT_TOTAL || '10');
+// Ruimte voor 5 gelijktijdige posities. Deze twee remmen werken SAMEN en moeten
+// bij elkaar passen: MAX_RISK_PCT_TOTAL moet minstens
+// (RISK_PCT_OVERRIDE x aantal posities) zijn, anders weigert de rem de tweede
+// trade terwijl MAX_OPEN nog ruimte heeft. Bij 10% per trade x 5 = 50.
+//
+// Verhoog je RISK_PCT_OVERRIDE, verhoog dan MAX_RISK_PCT_TOTAL mee, anders
+// blokkeert het weer. Railway-variabelen met dezelfde naam winnen van deze
+// defaults, dus je kunt het daar altijd nog overrulen.
+export const MAX_OPEN         = parseInt(process.env.MAX_OPEN_POSITIONS  || '5', 10);
+export const MAX_RISK_TOTAL   = parseFloat(process.env.MAX_RISK_PCT_TOTAL || '50');
 export const DEFAULT_RISK_PCT = parseFloat(process.env.DEFAULT_RISK_PCT   || '0.25');
 // Zet je RISK_PCT_OVERRIDE, dan wordt de risk_pct uit de webhook GENEGEERD en
 // geldt deze waarde voor elke trade. Zo draai je het risico terug zonder de
@@ -73,8 +81,19 @@ const FIRMS = {
 // bij het opstarten tegen wat MetaApi teruggeeft en waarschuwt bij verschil —
 // een verkeerde tickValue betekent een verkeerde positiegrootte, en dat merk je
 // anders pas als het misgaat.
+// LET OP — tickValue staat hier in EUR, de valuta van de rekening.
+// De rekening luidt in EUR, MT5 rekent winst en verlies in EUR uit, dus moet
+// calcLots dat ook doen. Stond hier de USD-waarde, dan rekende de app ~14% te
+// groot per punt en werd elke positie navenant te klein — en klopte
+// orders.risk_amount niet, waar tracker.js de R-multiples mee deelt.
+//
+// Gemeten aan een echte fill (NAS100, 0.1 lot, SL 333.73 punten = 28.98 EUR):
+//   0.8684 EUR per punt per lot  =  1.0073 USD  bij EURUSD 1.16
+//
+// Deze waarden drijven mee met EUR/USD. Een paar procent per jaar; loopt de
+// koers ver weg, dan hier bijstellen.
 export const SPECS = {
-  XAUUSD: { tickSize: 0.01, tickValue: 1.0, volMin: 0.01, volMax: 50, volStep: 0.01, digits: 2 },
+  XAUUSD: { tickSize: 0.01, tickValue: 0.862, volMin: 0.01, volMax: 100, volStep: 0.01, digits: 2 },
   NDX100: { tickSize: 0.01, tickValue: 0.1, volMin: 0.01, volMax: 40, volStep: 0.01, digits: 2 },
   'US100.cash': { tickSize: 0.01, tickValue: 0.1, volMin: 0.01, volMax: 40, volStep: 0.01, digits: 2 },
 
@@ -91,8 +110,11 @@ export const SPECS = {
   // CONTROLEER het in het MT5 symbool-informatiescherm voor je live gaat.
   // verifySpecs() waarschuwt bij het opstarten als tickSize of volStep afwijkt.
   //
-  // volMax 20 en digits 2 zijn aannames. Vul in wat de broker zegt.
-  NAS100: { tickSize: 0.01, tickValue: 0.01, volMin: 0.10, volMax: 20, volStep: 0.10, digits: 2 },
+  // volMin 0.10, volStep 0.10 en tickSize 0.01 zijn bevestigd door verifySpecs()
+  // tegen de broker. volMax 500 komt uit dezelfde bootlog.
+  // tickValue 0.008684 / tickSize 0.01 = 0.8684 EUR per indexpunt per lot —
+  // gemeten aan een werkelijke fill, niet meer afgeleid.
+  NAS100: { tickSize: 0.01, tickValue: 0.008684, volMin: 0.10, volMax: 500, volStep: 0.10, digits: 2 },
 };
 
 /** Alleen de symbolen die deze firm daadwerkelijk gebruikt. De opstartcontrole
