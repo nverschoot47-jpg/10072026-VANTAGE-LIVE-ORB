@@ -225,10 +225,18 @@ export async function closeOrder(orderId, c) {
      c.duration_min, c.r_multiple, c.close_reason]);
 }
 
+/**
+ * Open risico in de valuta van de rekening, plus het aantal open posities.
+ *
+ * Telt orders.risk_amount op — het WERKELIJKE risico dat bij de fill is
+ * uitgerekend, inclusief trades waar het minimum lot een hoger bedrag afdwong.
+ * Eerder werd signals.risk_pct opgeteld, en dat was de waarde uit de payload:
+ * de rem mat toen iets anders dan er op tafel lag.
+ */
 export async function openRiskPct() {
   const r = await pool.query(
-    `SELECT COALESCE(SUM(s.risk_pct), 0) AS total, COUNT(*) AS n
-       FROM orders o JOIN signals s ON s.id = o.signal_id
+    `SELECT COALESCE(SUM(o.risk_amount), 0) AS total, COUNT(*) AS n
+       FROM orders o
       WHERE o.status = 'open'`);
   return { total: parseFloat(r.rows[0].total), n: parseInt(r.rows[0].n, 10) };
 }
