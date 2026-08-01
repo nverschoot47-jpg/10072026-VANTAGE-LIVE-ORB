@@ -16,9 +16,9 @@ import * as broker from './broker.js';
 import * as tracker from './tracker.js';
 import * as guard from './guard.js';
 import {
-  FIRM, TRADING_ENABLED, MAX_OPEN, MAX_RISK_TOTAL, DEFAULT_RISK_PCT,
+  FIRM, TRADING_ENABLED, MAX_OPEN, MAX_RISK_TOTAL,
   mapSymbol, calcLots, SPECS, firmConfig, convertToMt5, scaleLevel, MAX_BASIS_PCT,
-  resolveRiskPct, RISK_OVERRIDE,
+  resolveRisk, RISK_EUR,
 } from './session.js';
 
 const app = express();
@@ -87,23 +87,19 @@ async function handleOrder(o) {
   if (sig.duplicate) return { slot_id: o.slot_id, ok: false, reason: 'duplicate (slot vuurde vandaag al)' };
 
   const { total, n } = await db.openRiskPct();
-  const { pct: riskPct, bron: riskBron } = resolveRiskPct(o.risk_pct);
+  const { eur: riskEur, bron: riskBron } = resolveRisk();
 
-  // insertSignal schreef o.risk_pct weg — de waarde UIT DE PAYLOAD. Zodra
-  // RISK_PCT_OVERRIDE gezet is, is dat niet het risico dat we werkelijk nemen.
-  // openRiskPct() telt die kolom op, dus zonder deze regel meet de rem iets
-  // anders dan er op tafel ligt: bij override 3% en payload 0.25% telt de rem
-  // 0.25 per positie en laat hij er 29 toe — samen bijna 60% van de rekening.
-  // De originele payloadwaarde blijft bewaard in signals.raw.
-  await db.pool.query('UPDATE signals SET risk_pct=$2 WHERE id=$1', [sig.id, riskPct]);
-
-  if (n >= MAX_OPEN) {
+  // ── Remmen ──────────────────────────────────────────────────────────────
+  // Beide staan standaard op 0 = UIT. Elke trade wordt genomen. Zet je ze in
+  // Railway op een getal groter dan 0, dan gelden ze weer — de code eronder is
+  // ongewijzigd gebleven zodat dat zonder deploy kan.
+  if (MAX_OPEN > 0 && n >= MAX_OPEN) {
     const r = `MAX_OPEN_POSITIONS bereikt (${n}/${MAX_OPEN})`;
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'rejected', r]);
     return { slot_id: o.slot_id, ok: false, reason: r };
   }
-  if (total + riskPct > MAX_RISK_TOTAL) {
-    const r = `MAX_RISK_PCT_TOTAL bereikt (${total.toFixed(2)}% + ${riskPct}% > ${MAX_RISK_TOTAL}%)`;
+  if (MAX_RISK_TOTAL > 0 && total + riskEur > MAX_RISK_TOTAL) {
+    const r = `MAX_RISK_EUR_TOTAL bereikt (${total.toFixed(2)} + ${riskEur} > ${MAX_RISK_TOTAL})`;
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'rejected', r]);
     return { slot_id: o.slot_id, ok: false, reason: r };
   }
@@ -130,7 +126,7 @@ async function handleOrder(o) {
     return { slot_id: o.slot_id, ok: false, reason: r };
   }
 
-  const sizing = calcLots({ symbol: mt5, equity: eq, riskPct, slPoints: cv.slPointsMt5 });
+  const sizing = calcLots({ symbol: mt5, riskEur, slPoints: cv.slPointsMt5 });
   if (!sizing.lots) {
     await db.pool.query('UPDATE signals SET status=$2, reason=$3 WHERE id=$1', [sig.id, 'rejected', sizing.reason]);
     return { slot_id: o.slot_id, ok: false, reason: sizing.reason };
@@ -168,7 +164,9 @@ async function handleOrder(o) {
 
     if (!dq.valid) console.warn(`[Data] ${o.slot_id} gemarkeerd als INVALID — ${dq.reasons.join('; ')}`);
     console.log(`[Order] ${o.slot_id} ${o.action} ${mt5} ${sizing.lots} lots @ ${res.fill} ` +
-                `SL ${res.sl} TP ${res.tp} | risk ${riskPct}% (${riskBron}) | stop ${slTv}tv -> ${cv.slPointsMt5}mt5 ` +
+                `SL ${res.sl} TP ${res.tp} | risk EUR ${sizing.riskAmount}` +
+                (sizing.forced ? ` [MIN LOT — doel was ${riskEur}]` : ` (${riskBron})`) +
+                ` | stop ${slTv}tv -> ${cv.slPointsMt5}mt5 ` +
                 `(${(cv.slPct * 100).toFixed(4)}%, basis ${cv.basisPct !== null ? (cv.basisPct * 100).toFixed(2) + '%' : 'n/b'})`);
     return { slot_id: o.slot_id, ok: true, order_id: orderId, lots: sizing.lots,
              fill: res.fill, sl_points_mt5: cv.slPointsMt5 };
@@ -231,8 +229,8 @@ app.get('/health', async (_req, res) => {
       broker_error: broker.isReady() ? null : broker.lastError(),
       account: broker.accountId(),
       open_positions: n, open_risk_pct: total,
-      limits: { max_open: MAX_OPEN, max_risk_pct: MAX_RISK_TOTAL },
-      risk_per_trade: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit de webhook',
+      limits: { max_open: MAX_OPEN || 'uit', max_risk_eur: MAX_RISK_TOTAL || 'uit', risk_eur: RISK_EUR },
+      risk_per_trade: `EUR ${RISK_EUR} vast`,
     });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -322,9 +320,8 @@ app.get('/api/system', async (_req, res) => {
     broker: broker.isReady(), broker_error: broker.lastError(),
     account: broker.accountId(), equity: null,
     open_positions: null, open_risk_pct: null,
-    limits: { max_open: MAX_OPEN, max_risk_pct: MAX_RISK_TOTAL, max_basis_pct: MAX_BASIS_PCT },
-    risk_per_trade: RISK_OVERRIDE !== null ? `${RISK_OVERRIDE}% (override)` : 'uit de webhook',
-    default_risk_pct: DEFAULT_RISK_PCT,
+    limits: { max_open: MAX_OPEN || 'uit', max_risk_eur: MAX_RISK_TOTAL || 'uit', risk_eur: RISK_EUR, max_basis_pct: MAX_BASIS_PCT },
+    risk_per_trade: `EUR ${RISK_EUR} vast`,
     breaker: null, slots: [], basis: [], errors: [], symbols: {}, specs: SPECS,
     db_error: null, now: new Date().toISOString(),
   };
