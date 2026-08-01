@@ -47,6 +47,11 @@ export const MAX_BASIS_PCT    = parseFloat(process.env.MAX_BASIS_PCT || '5');
 // AFSTANDEN, geen niveaus — die vertalen wél één-op-één. De absolute `entry`,
 // `sl` en `tp` uit de payload zijn daarom alleen logging; de echte SL/TP
 // worden hier herrekend vanaf de werkelijke MT5-fill.
+//
+// De vier crypto-symbolen (BTCUSD, ETHUSD, XRPUSD, SOLUSD) zijn GEEN futures
+// -> CFD vertaling. Het alert stuurt al de kale Vantage-ticker (zelfde chart,
+// zelfde naam), dus die vier staan hieronder 1-op-1. convertToMt5() schaalt
+// dan feitelijk niets — basis blijft ~0% — en dat is precies de bedoeling.
 const FIRMS = {
   fundednext: {
     label: 'FundedNext',
@@ -69,11 +74,12 @@ const FIRMS = {
   // EN als symbool bestaan bij Vantage, anders wordt het signaal geweigerd met
   // "geen symboolmapping".
   //
-  // MET1! (Micro Ether) staat er BEWUST niet bij. Het enige Ethereum-achtige
-  // symbool bij Vantage in deze lijst is ETCUSD, en dat is Ethereum CLASSIC —
-  // een andere munt, koers 6.55 tegen 1875 voor Ether. Die mapping zou een
-  // basis van 28000% geven. Bestaat er een ETHUSD bij Vantage, voeg die dan hier
-  // toe; tot die tijd handelt MET1! niet mee.
+  // Crypto (BTCUSD/ETHUSD/XRPUSD/SOLUSD) draait rechtstreeks op de Vantage-
+  // ticker zelf, geen futures-omweg meer. MBT1!/MET1! zijn hier bewust
+  // verwijderd — dat was de oude Micro Bitcoin/Ether futures-mapping en gaf
+  // op ETCUSD (Ethereum Classic i.p.v. Ether) een basis van 28000%. Stuurt de
+  // PineScript ooit weer een futures-ticker voor crypto, dan moet die eerst
+  // hier terugkomen vóórdat hij mag vuren.
   vantage: {
     label: 'Vantage',
     symbols: {
@@ -81,12 +87,10 @@ const FIRMS = {
       'MNQ1!': 'NAS100',    // Micro Nasdaq
       'SIL1!': 'XAGUSD',    // Micro Silver
       'MCL1!': 'CL-OIL',    // Micro WTI  -> future-CFD, kleinste basis
-      'MBT1!': 'BTCUSD',    // Micro Bitcoin
-      'MET1!': 'ETHUSD',    // Micro Ether — LET OP: ETHUSD, niet ETCUSD.
-                            // ETCUSD is Ethereum Classic, koers ~6.55 tegen
-                            // ~1875 voor Ether. Die verwisseling geeft een
-                            // basis van 28000% en een volstrekt verkeerde
-                            // positiegrootte.
+      'BTCUSD': 'BTCUSD',   // Bitcoin  — 1-op-1, geen futures-omweg
+      'ETHUSD': 'ETHUSD',   // Ethereum — 1-op-1, geen futures-omweg
+      'XRPUSD': 'XRPUSD',   // Ripple   — 1-op-1, geen futures-omweg
+      'SOLUSD': 'SOLUSD',   // Solana   — 1-op-1, geen futures-omweg
       'GER40': 'GER40',     // DAX
       'UK100': 'UK100',     // FTSE 100
     },
@@ -158,8 +162,20 @@ export const SPECS = {
   XAGUSD:   spec({ contract: 5000, digits: 3, valuta: 'USD', volMin: 0.01, volMax:  20, volStep: 0.01 }),
   NAS100:   spec({ contract:    1, digits: 2, valuta: 'USD', volMin: 0.10, volMax: 500, volStep: 0.10 }),
   'CL-OIL': spec({ contract: 1000, digits: 3, valuta: 'USD', volMin: 0.01, volMax:  20, volStep: 0.01 }),
-  BTCUSD:   spec({ contract:    1, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
-  ETHUSD:   spec({ contract:    1, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+
+  // ── Crypto — afgelezen uit de "Eigenschappen" schermen (1 aug 2026) ──────
+  // Winst valuta is bij alle vier USD, dus fx-omrekening loopt hier hetzelfde
+  // als bij XAUUSD/NAS100 hierboven. Marge valuta (BTC/ETH/XRP/SOL) doet niet
+  // mee in calcLots — dat raakt alleen hoeveel marge MT5 blokkeert, niet de
+  // risicoberekening in EUR.
+  // LET OP volMax: niet afgelezen (scherm liep af bij "Minimale volume 0.01").
+  // Hier voorlopig gelijk gezet aan XAUUSD (100) — check dit in MT5 en pas aan
+  // zodra je de echte "Maximale volume" per symbool hebt.
+  BTCUSD:   spec({ contract:     1, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+  ETHUSD:   spec({ contract:     1, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+  XRPUSD:   spec({ contract: 10000, digits: 4, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+  SOLUSD:   spec({ contract:    10, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+
   GER40:    spec({ contract:    1, digits: 2, valuta: 'EUR', volMin: 0.10, volMax: 500, volStep: 0.10 }),
   UK100:    spec({ contract:    1, digits: 2, valuta: 'GBP', volMin: 0.10, volMax: 500, volStep: 0.10 }),
 };
@@ -255,6 +271,10 @@ export function valuePerUnit(symbol) {
  * Daarom wordt alles als PERCENTAGE overgezet en pas op de werkelijke MT5-prijs
  * weer in punten omgerekend. De multiplier zit al in sl_points verwerkt door de
  * PineScript; hier wordt alleen geschaald, nooit vermenigvuldigd.
+ *
+ * Voor de 1-op-1 crypto-symbolen (BTCUSD/ETHUSD/XRPUSD/SOLUSD) verandert hier
+ * niets: entry_tv en mt5Ref liggen (op normale slippage na) al bij elkaar, dus
+ * ratio ≈ 1 en basisPct ≈ 0%. Geen aparte tak nodig.
  */
 export function convertToMt5({ tvEntry, mt5Ref, slPointsTv, tpPointsTv }) {
   const tv = parseFloat(tvEntry);
