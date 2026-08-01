@@ -9,33 +9,31 @@
 export const FIRM             = process.env.FIRM || 'fundednext';
 export const TRADING_ENABLED  = (process.env.TRADING_ENABLED ?? 'true') === 'true';
 export const ENFORCE_EXPIRY   = (process.env.ENFORCE_EXPIRY ?? 'false') === 'true';
-// Ruimte voor 5 gelijktijdige posities. Deze twee remmen werken SAMEN en moeten
-// bij elkaar passen: MAX_RISK_PCT_TOTAL moet minstens
-// (RISK_PCT_OVERRIDE x aantal posities) zijn, anders weigert de rem de tweede
-// trade terwijl MAX_OPEN nog ruimte heeft. Bij 10% per trade x 5 = 50.
-//
-// Verhoog je RISK_PCT_OVERRIDE, verhoog dan MAX_RISK_PCT_TOTAL mee, anders
-// blokkeert het weer. Railway-variabelen met dezelfde naam winnen van deze
-// defaults, dus je kunt het daar altijd nog overrulen.
-export const MAX_OPEN         = parseInt(process.env.MAX_OPEN_POSITIONS  || '5', 10);
-export const MAX_RISK_TOTAL   = parseFloat(process.env.MAX_RISK_PCT_TOTAL || '50');
-export const DEFAULT_RISK_PCT = parseFloat(process.env.DEFAULT_RISK_PCT   || '0.25');
-// Zet je RISK_PCT_OVERRIDE, dan wordt de risk_pct uit de webhook GENEGEERD en
-// geldt deze waarde voor elke trade. Zo draai je het risico terug zonder de
-// PineScript aan te raken en zonder opnieuw te deployen — één variabele in
-// Railway, opslaan, klaar. Leeg laten = de waarde uit de payload gebruiken.
-const _ovr = process.env.RISK_PCT_OVERRIDE;
-export const RISK_OVERRIDE = (_ovr !== undefined && _ovr !== '') ? parseFloat(_ovr) : null;
 
-/** Welk risico geldt er voor deze order? Override wint, dan payload, dan default. */
-export function resolveRiskPct(payloadValue) {
-  if (RISK_OVERRIDE !== null && !Number.isNaN(RISK_OVERRIDE)) {
-    return { pct: RISK_OVERRIDE, bron: 'RISK_PCT_OVERRIDE' };
-  }
-  const p = parseFloat(payloadValue);
-  if (p > 0) return { pct: p, bron: 'payload' };
-  return { pct: DEFAULT_RISK_PCT, bron: 'DEFAULT_RISK_PCT' };
+// ── Risico: VAST BEDRAG PER TRADE ─────────────────────────────────────────
+// Niet langer een percentage van de equity, maar een vast bedrag in de valuta
+// van de rekening. Reden: bij een kleine rekening dwingt de minimale lotgrootte
+// van de broker het percentage toch al vast, en dan is een percentage alleen
+// maar een omweg die verhult wat je werkelijk riskeert.
+export const RISK_EUR = parseFloat(process.env.RISK_EUR || '20');
+
+// ── Remmen: 0 = UIT ───────────────────────────────────────────────────────
+// Bewust uitgezet. Elke trade die binnenkomt wordt genomen; er is geen grens
+// op het aantal open posities en geen grens op het totale open risico.
+//
+// Wat dat betekent, zonder omhaal: bij 8 symbolen x 48 slots kunnen er in
+// theorie tientallen posities tegelijk openstaan, elk met RISK_EUR aan risico.
+// Twintig open posities is EUR 400 aan risico, en niets in deze code houdt dat
+// tegen. Wil je later toch een dak, zet dan MAX_OPEN_POSITIONS of
+// MAX_RISK_EUR_TOTAL in Railway op een getal groter dan 0.
+export const MAX_OPEN       = parseInt(process.env.MAX_OPEN_POSITIONS || '0', 10);
+export const MAX_RISK_TOTAL = parseFloat(process.env.MAX_RISK_EUR_TOTAL || '0');
+
+/** Het risicobedrag voor deze order. De payload doet er niet meer toe. */
+export function resolveRisk() {
+  return { eur: RISK_EUR, bron: 'RISK_EUR' };
 }
+
 export const TRACK_INTERVAL   = parseInt(process.env.TRACK_INTERVAL_SEC  || '60', 10) * 1000;
 // Maximaal toegestaan verschil tussen de futures-prijs van TradingView en de
 // CFD-prijs van de broker. Klopt de mapping niet (MGC1! -> een Nasdaq-symbool),
@@ -67,14 +65,34 @@ const FIRMS = {
   },
   // Vantage draait LIVE. Nasdaq heet hier NAS100 — niet NDX100 (FundedNext) en
   // niet US100.cash (FTMO). Drie brokers, drie namen voor hetzelfde instrument.
+  // Vantage — LIVE. Elke ticker hieronder moet in TradingView op je chart staan
+  // EN als symbool bestaan bij Vantage, anders wordt het signaal geweigerd met
+  // "geen symboolmapping".
+  //
+  // MET1! (Micro Ether) staat er BEWUST niet bij. Het enige Ethereum-achtige
+  // symbool bij Vantage in deze lijst is ETCUSD, en dat is Ethereum CLASSIC —
+  // een andere munt, koers 6.55 tegen 1875 voor Ether. Die mapping zou een
+  // basis van 28000% geven. Bestaat er een ETHUSD bij Vantage, voeg die dan hier
+  // toe; tot die tijd handelt MET1! niet mee.
   vantage: {
     label: 'Vantage',
     symbols: {
-      'MGC1!': 'XAUUSD',
-      'MNQ1!': 'NAS100',
+      'MGC1!': 'XAUUSD',    // Micro Gold
+      'MNQ1!': 'NAS100',    // Micro Nasdaq
+      'SIL1!': 'XAGUSD',    // Micro Silver
+      'MCL1!': 'CL-OIL',    // Micro WTI  -> future-CFD, kleinste basis
+      'MBT1!': 'BTCUSD',    // Micro Bitcoin
+      'MET1!': 'ETHUSD',    // Micro Ether — LET OP: ETHUSD, niet ETCUSD.
+                            // ETCUSD is Ethereum Classic, koers ~6.55 tegen
+                            // ~1875 voor Ether. Die verwisseling geeft een
+                            // basis van 28000% en een volstrekt verkeerde
+                            // positiegrootte.
+      'GER40': 'GER40',     // DAX
+      'UK100': 'UK100',     // FTSE 100
     },
   },
 };
+
 
 // ── Contractspecificaties ──────────────────────────────────────────────────
 // Overgenomen uit het MT5 symbool-informatiescherm. De poller controleert deze
@@ -92,30 +110,61 @@ const FIRMS = {
 //
 // Deze waarden drijven mee met EUR/USD. Een paar procent per jaar; loopt de
 // koers ver weg, dan hier bijstellen.
+// ── Wisselkoersen ─────────────────────────────────────────────────────────
+// De rekening luidt in EUR. Symbolen die in USD of GBP afrekenen moeten worden
+// omgerekend, anders klopt het risicobedrag niet.
+//
+// Dit zijn de ENIGE twee getallen die je moet bijstellen als de koersen ver
+// weglopen. Alle tickValues eronder worden hieruit berekend. Een paar procent
+// drift is onschadelijk; tien procent scheelt tien procent in je positiegrootte.
+const EURUSD = 1.16;
+const GBPEUR = 1.15;
+
+/**
+ * Contractspecificatie uit de MT5-symboolgegevens.
+ *
+ * Alle velden hieronder zijn AFGELEZEN, niet geraden:
+ *   contract  = "Contract grootte"
+ *   digits    = "Digits"          -> tickSize = 10^-digits
+ *   valuta    = "Winst valuta"
+ *   volMin/volMax/volStep = "Minimale/Maximale volume", "Volume stap"
+ *
+ * tickValue wordt eruit berekend: contract x tickSize, omgerekend naar EUR.
+ * Dat is beter dan acht losse getallen intypen — bij een koerswijziging pas je
+ * EURUSD aan en schuift alles mee.
+ *
+ * Gecontroleerd: NAS100 toont in MT5 expliciet tickValue 0.01 USD, en een echte
+ * fill (0.1 lot, SL 333.73 punten = 28.98 EUR) bevestigt dezelfde uitkomst.
+ */
+function spec({ contract, digits, valuta, volMin, volMax, volStep }) {
+  const tickSize = Math.pow(10, -digits);
+  const fx       = valuta === 'USD' ? 1 / EURUSD : valuta === 'GBP' ? GBPEUR : 1;
+  return {
+    tickSize,
+    tickValue: +(contract * tickSize * fx).toFixed(8),
+    volMin, volMax, volStep,
+    digits,
+    contract, valuta,          // alleen ter controle in /health en de bootlog
+  };
+}
+
 export const SPECS = {
-  XAUUSD: { tickSize: 0.01, tickValue: 0.862, volMin: 0.01, volMax: 100, volStep: 0.01, digits: 2 },
+  // ── FundedNext / FTMO (ongewijzigd, USD-rekening) ────────────────────────
   NDX100: { tickSize: 0.01, tickValue: 0.1, volMin: 0.01, volMax: 40, volStep: 0.01, digits: 2 },
   'US100.cash': { tickSize: 0.01, tickValue: 0.1, volMin: 0.01, volMax: 40, volStep: 0.01, digits: 2 },
 
-  // ── Vantage ──────────────────────────────────────────────────────────────
-  // volMin en volStep staan hier op 0.10: Vantage handelt Nasdaq in tienden van
-  // een lot, niet in honderdsten zoals FundedNext. Dat is geen detail — met
-  // volStep 0.01 stuur je een lotgrootte die deze broker weigert.
-  //
-  // tickValue/tickSize = 0.01/0.01 = 1.00 USD per indexpunt per lot.
-  // Die verhouding is AFGELEID, niet afgelezen: jouw Vantage-code rekent
-  // lots = risicobedrag / stopafstand zonder deler, wat exact 1 USD per punt
-  // betekent. Het kruiscontroleert met FundedNext — 0.10 lot x 1 USD/pt en
-  // 0.01 lot x 10 USD/pt zijn allebei 0.10 USD per punt minimum — maar
-  // CONTROLEER het in het MT5 symbool-informatiescherm voor je live gaat.
-  // verifySpecs() waarschuwt bij het opstarten als tickSize of volStep afwijkt.
-  //
-  // volMin 0.10, volStep 0.10 en tickSize 0.01 zijn bevestigd door verifySpecs()
-  // tegen de broker. volMax 500 komt uit dezelfde bootlog.
-  // tickValue 0.008684 / tickSize 0.01 = 0.8684 EUR per indexpunt per lot —
-  // gemeten aan een werkelijke fill, niet meer afgeleid.
-  NAS100: { tickSize: 0.01, tickValue: 0.008684, volMin: 0.10, volMax: 500, volStep: 0.10, digits: 2 },
+  // ── Vantage — alles afgelezen uit het MT5 symbool-informatiescherm ───────
+  XAUUSD:   spec({ contract:  100, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+  XAGUSD:   spec({ contract: 5000, digits: 3, valuta: 'USD', volMin: 0.01, volMax:  20, volStep: 0.01 }),
+  NAS100:   spec({ contract:    1, digits: 2, valuta: 'USD', volMin: 0.10, volMax: 500, volStep: 0.10 }),
+  'CL-OIL': spec({ contract: 1000, digits: 3, valuta: 'USD', volMin: 0.01, volMax:  20, volStep: 0.01 }),
+  BTCUSD:   spec({ contract:    1, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+  ETHUSD:   spec({ contract:    1, digits: 2, valuta: 'USD', volMin: 0.01, volMax: 100, volStep: 0.01 }),
+  GER40:    spec({ contract:    1, digits: 2, valuta: 'EUR', volMin: 0.10, volMax: 500, volStep: 0.10 }),
+  UK100:    spec({ contract:    1, digits: 2, valuta: 'GBP', volMin: 0.10, volMax: 500, volStep: 0.10 }),
 };
+
+
 
 /** Alleen de symbolen die deze firm daadwerkelijk gebruikt. De opstartcontrole
  *  liep eerst over ALLE specs heen, inclusief die van een andere firm — vandaar
@@ -145,33 +194,47 @@ export function mapSymbol(tvSymbol) {
  *
  * lots = risicobedrag / (stopafstand × waarde per prijsbeweging)
  */
-export function calcLots({ symbol, equity, riskPct, slPoints }) {
+export function calcLots({ symbol, riskEur, slPoints }) {
   const spec = SPECS[symbol];
   if (!spec) return { lots: null, reason: `geen contractspecificatie voor ${symbol}` };
   if (!(slPoints > 0)) return { lots: null, reason: `ongeldige sl_points: ${slPoints}` };
 
-  const riskAmount   = equity * (riskPct / 100);
-  const valuePerUnit = spec.tickValue / spec.tickSize;
-  const raw          = riskAmount / (slPoints * valuePerUnit);
+  const valuePerUnit = spec.tickValue / spec.tickSize;   // bedrag per 1.0 prijsbeweging per lot
+  const raw          = riskEur / (slPoints * valuePerUnit);
 
   // Naar beneden afronden op volStep: liever iets minder risico dan iets meer.
-  // De +1e-9 vangt drijvende-kommaruis op. Bij volStep 0.10 (Vantage NAS100)
-  // levert 0.3 / 0.1 in JavaScript 2.9999999999999996 op — zonder deze marge
-  // rondt Math.floor dat af naar 2 stappen en handel je 0.2 lot in plaats van
-  // 0.3. Bij volStep 0.01 viel dat nooit op; bij 0.10 is het een tiende lot.
-  const steps   = Math.floor(raw / spec.volStep + 1e-9);
-  let   lots    = +(steps * spec.volStep).toFixed(8);
+  // De +1e-9 vangt drijvende-kommaruis: 0.3 / 0.1 geeft in JavaScript
+  // 2.9999999999999996, en dan zou Math.floor er 2 stappen van maken.
+  const steps = Math.floor(raw / spec.volStep + 1e-9);
+  let   lots  = +(steps * spec.volStep).toFixed(8);
 
+  // ── Stop te wijd voor het risicobedrag ──────────────────────────────────
+  // Vroeger werd de order hier geweigerd. Nu niet meer: we nemen het minimum
+  // lot en accepteren dat het risico HOGER uitvalt dan RISK_EUR. Dat is een
+  // bewuste keuze — bij een brede stop is dit een swing waar je zelf naar kijkt.
+  //
+  // Het werkelijke risico wordt teruggegeven en weggeschreven, zodat je
+  // achteraf kunt zien welke trades boven het bedrag uitkwamen en hoeveel.
+  // Zonder die registratie zou een 34-euro trade er in de statistiek uitzien
+  // als een 20-euro trade, en klopt elke R-multiple niet meer.
+  let forced = false;
   if (lots < spec.volMin) {
-    return {
-      lots: null,
-      reason: `berekende omvang ${raw.toFixed(4)} ligt onder volMin ${spec.volMin} ` +
-              `(risico ${riskAmount.toFixed(2)} bij stop ${slPoints})`,
-    };
+    lots   = spec.volMin;
+    forced = true;
   }
   if (lots > spec.volMax) lots = spec.volMax;
 
-  return { lots, riskAmount, valuePerUnit, raw };
+  // Wat er ECHT op het spel staat bij deze lotgrootte.
+  const riskAmount = +(lots * slPoints * valuePerUnit).toFixed(2);
+
+  return {
+    lots,
+    riskAmount,          // werkelijk risico in rekeningvaluta
+    riskTarget: riskEur, // wat je vroeg
+    forced,              // true = minimum lot afgedwongen, risico is hoger
+    valuePerUnit,
+    raw,
+  };
 }
 
 /** Bedrag dat één prijsbeweging waard is — gebruikt om R uit te rekenen bij close. */
