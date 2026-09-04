@@ -15,7 +15,13 @@ export const ENFORCE_EXPIRY   = (process.env.ENFORCE_EXPIRY ?? 'false') === 'tru
 // van de rekening. Reden: bij een kleine rekening dwingt de minimale lotgrootte
 // van de broker het percentage toch al vast, en dan is een percentage alleen
 // maar een omweg die verhult wat je werkelijk riskeert.
-export const RISK_EUR = parseFloat(process.env.RISK_EUR || '20');
+//
+// 4 sep 2026: verhoogd van 20 naar 50 per trade.
+// LET OP — dit getal is alleen de FALLBACK. Staat RISK_EUR in Railway onder
+// Variables, dan wint die en verandert er door deze regel niets. Controleer
+// dat eerst: of zet RISK_EUR=50 daar, of haal de variabele weg zodat deze
+// standaardwaarde geldt. /health toont wat er werkelijk actief is.
+export const RISK_EUR = parseFloat(process.env.RISK_EUR || '50');
 
 // ── Remmen: 0 = UIT ───────────────────────────────────────────────────────
 // Bewust uitgezet. Elke trade die binnenkomt wordt genomen; er is geen grens
